@@ -161,6 +161,9 @@ unsafe extern "C" fn read_athena_bind(bind_info: duckdb_bind_info) {
                 return;
             }
         };
+        // as_i32() returns 0 when the parameter is not provided (null value),
+        // which is distinct from an explicit 0 (which is also treated as DEFAULT_LIMIT
+        // since a limit of 0 rows is not meaningful for a scan).
         let maxrows = bi.get_named_parameter_value("maxrows").as_i32();
 
         let config = crate::RUNTIME
@@ -193,7 +196,7 @@ unsafe extern "C" fn read_athena_bind(bind_info: duckdb_bind_info) {
             }
         }
 
-        let limit = if maxrows != 0 { maxrows } else { DEFAULT_LIMIT };
+        let limit = if maxrows > 0 { maxrows } else { DEFAULT_LIMIT };
         FfiBindData::<ScanBindData>::set(bind_info, ScanBindData::new(&tablename, &output_location, limit));
     }
 }
