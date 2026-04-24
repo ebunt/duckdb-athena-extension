@@ -1,88 +1,47 @@
 # DuckDB Athena Extension
 
-> **WARNING** This is a work in progress - things may or may not work as expected 🧙‍♂️
+> **Work in progress** — things may not work as expected
 
 Query Amazon Athena tables directly from DuckDB using `athena_scan`.
 
-## Limitations
-
-- Not all data types are implemented yet
-- 10,000 results are returned by default (use `maxrows=-1` to return everything)
-- Filter pushdown is not supported — the full table is always scanned
-
 ## Prerequisites
 
-- [Rust](https://rustup.rs/) stable toolchain (`rustup install stable`)
-- [DuckDB CLI](https://duckdb.org/docs/installation/) v1.4 or later
-- AWS credentials with permissions for Athena, Glue, and S3
+- Rust stable toolchain (`rustup install stable`)
+- DuckDB CLI v1.5+
+- AWS credentials with access to Athena, Glue, and S3
 
-## Building from source
+## Build
 
-Clone the repository and build with Cargo:
-
-1. This does not work unless you rename the file to `duckdb_extension`
-```bash
-git clone https://github.com/ebunt/duckdb-athena-extension.git
-cd duckdb-athena-extension
-cargo build --release
-```
-2. Instead, this is wrapped in a `Makefile` - `USE THIS`
 ```bash
 make
 ```
 
-The compiled extension is placed in `target/release/` with a platform-specific name:
-
-| Platform | Raw output file |
-|---|---|
-| Linux | `target/release/libduckdb_athena.so` |
-| macOS | `target/release/libduckdb_athena.dylib` |
-| Windows | `target/release/duckdb_athena.dll` |
-
-DuckDB 1.0+ only loads files with the `.duckdb_extension` suffix, so copy the output to the required name:
-
-```bash
-# Linux
-cp target/release/libduckdb_athena.so target/release/duckdb_athena.duckdb_extension
-
-# macOS
-cp target/release/libduckdb_athena.dylib target/release/duckdb_athena.duckdb_extension
-
-# Windows (PowerShell)
-Copy-Item target\release\duckdb_athena.dll target\release\duckdb_athena.duckdb_extension
-```
+This compiles the extension and places it at `target/release/duckdb_athena.duckdb_extension`.
 
 ## AWS credentials
 
-The extension reads AWS credentials and region from the standard environment variables:
+Set standard AWS environment variables, or use any credential source the AWS SDK supports (instance profile, SSO, `~/.aws/credentials`):
 
 ```bash
-export AWS_ACCESS_KEY_ID=<your-access-key>
-export AWS_SECRET_ACCESS_KEY=<your-secret-key>
+export AWS_ACCESS_KEY_ID=...
+export AWS_SECRET_ACCESS_KEY=...
 export AWS_REGION=us-east-1
 ```
 
-Any credential source supported by the AWS SDK (instance profile, SSO, `~/.aws/credentials`, etc.) also works.
-
-The IAM principal needs at minimum:
+Required IAM permissions:
 - `athena:StartQueryExecution`, `athena:GetQueryExecution`, `athena:GetQueryResults`
 - `glue:GetTable` on the target table
-- `s3:PutObject` / `s3:GetObject` on the S3 results bucket
+- `s3:PutObject`, `s3:GetObject` on the S3 results bucket
 
-## Loading the extension
+## Load
 
-DuckDB 1.0+ requires two things when loading a locally compiled extension:
-
-1. **`.duckdb_extension` suffix** – DuckDB will refuse to load any file that does not end with `.duckdb_extension`.
-2. **Metadata-mismatch bypass** – locally compiled extensions do not carry the same build metadata that DuckDB expects from official releases, so the `allow_extensions_metadata_mismatch` setting must be enabled.
-
-Start DuckDB with the `-unsigned` flag and set `allow_extensions_metadata_mismatch` before loading:
+Start DuckDB with the `-unsigned` flag (required because the extension is locally compiled without a release signature):
 
 ```bash
-AWS_REGION=us-east-1 duckdb -unsigned -cmd "SET allow_extensions_metadata_mismatch=true;"
+duckdb -unsigned
 ```
 
-Then load the extension (the path is the same on all platforms after the copy step above):
+Then load the extension:
 
 ```sql
 LOAD 'target/release/duckdb_athena.duckdb_extension';
@@ -90,15 +49,17 @@ LOAD 'target/release/duckdb_athena.duckdb_extension';
 
 ## Usage
 
-### Basic query
+### Basic scan
 
-Provide the Glue table name and an S3 path where Athena should write query results:
+Provide the Glue table name and an S3 output location for Athena results:
 
 ```sql
 SELECT * FROM athena_scan('my_table', 's3://my-results-bucket/prefix/');
 ```
 
-By default the `default` Glue database is used. To query a table in a different database pass the `database` named parameter:
+### Specify a Glue database
+
+Defaults to the `default` database. Pass `database=` to override:
 
 ```sql
 SELECT * FROM athena_scan('my_table', 's3://my-results-bucket/prefix/', database='my_database');
@@ -106,35 +67,28 @@ SELECT * FROM athena_scan('my_table', 's3://my-results-bucket/prefix/', database
 
 ### Return all rows
 
-By default only the first 10,000 rows are returned. Pass `maxrows=-1` to remove the limit:
+The default limit is 10,000 rows. Pass `maxrows=-1` to remove it:
 
 ```sql
 SELECT * FROM athena_scan('my_table', 's3://my-results-bucket/prefix/', maxrows=-1);
 ```
 
-### Filter after scanning
+### Filter results
 
-Filter pushdown is not yet supported, so add WHERE clauses in DuckDB after the scan:
+Filter pushdown is not implemented — DuckDB filters after the full scan:
 
 ```sql
 SELECT * FROM athena_scan('my_table', 's3://my-results-bucket/prefix/', maxrows=-1)
 WHERE year = 2024;
 ```
 
-## Testing
-
-There are no automated unit tests in this repository yet. To verify the extension works end-to-end:
-
-1. Build the extension as described above.
-2. Export your AWS credentials and region.
-3. Start DuckDB with `-unsigned` and `allow_extensions_metadata_mismatch=true`, then load the extension.
-4. Run a query against a known table in your default Glue catalog:
+### Count rows
 
 ```sql
 SELECT COUNT(*) FROM athena_scan('my_table', 's3://my-results-bucket/prefix/');
 ```
 
-You should see console output like:
+Query progress is printed to the console:
 
 ```
 Running Athena query, execution id: 152a20c7-ff32-4a19-bb71-ae0135373ca6
@@ -142,8 +96,9 @@ State: Running, sleeping 5 secs...
 Total execution time: 1307 millis
 ```
 
-followed by the result set.
+## Limitations
 
-## Credits
-
-- Rust DuckDB extension FFI: https://github.com/ywilkof/quack-rs
+- Not all Athena data types are supported (complex types: array, map, struct)
+- Filter pushdown is not implemented — the full table is always scanned
+- Defaults to 10,000 rows (`maxrows=-1` to disable)
+- Workgroup is hardcoded to `primary`

@@ -16,7 +16,7 @@ endif
 LIB_NAME = duckdb_athena
 TARGET_DIR = target/release
 BUILT_LIB = $(TARGET_DIR)/$(PREFIX)$(LIB_NAME).$(EXT)
-EXTENSION = $(TARGET_DIR)/$(PREFIX)$(LIB_NAME).$(EXT).duckdb_extension
+EXTENSION = $(TARGET_DIR)/$(LIB_NAME).duckdb_extension
 
 .PHONY: all build clean
 
@@ -25,7 +25,8 @@ all: build
 build:
 	cargo build --release
 	cp $(BUILT_LIB) $(EXTENSION)
-	@echo "Extension built and copied to: $(EXTENSION)"
+	python3 scripts/append_extension_footer.py $(EXTENSION)
+	@echo "Extension ready: $(EXTENSION)"
 
 clean:
 	cargo clean

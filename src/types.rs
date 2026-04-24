@@ -6,7 +6,8 @@ use quack_rs::{types::TypeId, vector::VectorWriter};
 
 use crate::error::{Error, Result};
 
-// Maps Athena data types to DuckDB types
+// Maps Athena data types to DuckDB types.
+// Only returns non-Varchar types when populate_column can write them correctly.
 // Supported types are listed here: https://docs.aws.amazon.com/athena/latest/ug/data-types.html
 pub fn map_type(col_type: String) -> Result<TypeId> {
     let type_id = match col_type.as_str() {
@@ -17,10 +18,10 @@ pub fn map_type(col_type: String) -> Result<TypeId> {
         "bigint" => TypeId::BigInt,
         "double" => TypeId::Double,
         "float" => TypeId::Float,
-        "decimal" => TypeId::Decimal,
+        // Decimal, date, and timestamp are returned as strings by Athena.
+        // Register as Varchar to avoid writing string data into fixed-width vectors.
+        "decimal" | "date" | "timestamp" => TypeId::Varchar,
         "string" | "varchar" | "char" => TypeId::Varchar,
-        "date" => TypeId::Date,
-        "timestamp" => TypeId::Timestamp,
         _ => {
             return Err(Error::DuckDB(format!("Unsupported data type: {col_type}")));
         }
@@ -39,6 +40,11 @@ pub unsafe fn populate_column(
     unsafe {
         let vector = duckdb_data_chunk_get_vector(output, col_idx as idx_t);
         match col_type {
+            TypeId::Boolean => {
+                let v = value.eq_ignore_ascii_case("true");
+                let mut writer = VectorWriter::new(vector);
+                writer.write_bool(row_idx, v);
+            }
             TypeId::BigInt => {
                 if let Ok(v) = value.parse::<i64>() {
                     let mut writer = VectorWriter::new(vector);
@@ -76,7 +82,8 @@ pub unsafe fn populate_column(
                 }
             }
             _ => {
-                // Varchar, Boolean, Date, Timestamp, Decimal, and others: write as string
+                // Varchar and any other type: write as string.
+                // SAFETY: only reached for types registered as Varchar with DuckDB.
                 let bytes = value.as_bytes();
                 duckdb_vector_assign_string_element_len(
                     vector,
@@ -88,4 +95,3 @@ pub unsafe fn populate_column(
         }
     }
 }
-

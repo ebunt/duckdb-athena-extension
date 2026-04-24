@@ -106,18 +106,23 @@ pub fn result_set_to_duckdb_data_chunk(
     chunk: duckdb_data_chunk,
 ) -> anyhow::Result<()> {
     let result_size = rows.len();
+    let col_infos = metadata.column_info();
+    let chunk_col_count = unsafe { libduckdb_sys::duckdb_data_chunk_get_column_count(chunk) } as usize;
 
     for row_idx in 0..result_size {
         let row = &rows[row_idx];
         let row_data = row.data();
         for col_idx in 0..row_data.len() {
-            let value = row_data[col_idx].var_char_value().unwrap_or("");
-            let col_infos = metadata.column_info();
-            if col_idx < col_infos.len() {
-                let col_type_str = col_infos[col_idx].r#type().to_string();
-                let ddb_type = map_type(col_type_str).unwrap_or(TypeId::Varchar);
-                unsafe { populate_column(value, ddb_type, chunk, row_idx, col_idx) };
+            // Guard against both Athena metadata and DuckDB chunk column counts.
+            // They should be equal, but if they diverge (e.g. unsupported column
+            // types were skipped) we must not write past the chunk boundary.
+            if col_idx >= col_infos.len() || col_idx >= chunk_col_count {
+                break;
             }
+            let value = row_data[col_idx].var_char_value().unwrap_or("");
+            let col_type_str = col_infos[col_idx].r#type().to_string();
+            let ddb_type = map_type(col_type_str).unwrap_or(TypeId::Varchar);
+            unsafe { populate_column(value, ddb_type, chunk, row_idx, col_idx) };
         }
     }
 
@@ -133,10 +138,35 @@ fn status(resp: &GetQueryExecutionOutput) -> Option<QueryExecutionState> {
         .cloned()
 }
 
-fn total_execution_time(resp: &GetQueryExecutionOutput) -> Option<i64> {
-    resp.query_execution()
-        .and_then(|qe| qe.statistics())
-        .and_then(|s| s.total_execution_time_in_millis())
+fn print_query_stats(resp: &GetQueryExecutionOutput) {
+    let stats = resp.query_execution().and_then(|qe| qe.statistics());
+    let Some(s) = stats else { return };
+
+    if let Some(queue_ms) = s.query_queue_time_in_millis() {
+        println!("Time in queue: {} ms", queue_ms);
+    }
+    if let Some(run_ms) = s.engine_execution_time_in_millis() {
+        println!("Run time: {} ms", run_ms);
+    }
+    if let Some(bytes) = s.data_scanned_in_bytes() {
+        println!("Data scanned: {}", format_bytes(bytes));
+    }
+}
+
+fn format_bytes(bytes: i64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    const GB: f64 = MB * 1024.0;
+    let b = bytes as f64;
+    if b >= GB {
+        format!("{:.2} GB", b / GB)
+    } else if b >= MB {
+        format!("{:.2} MB", b / MB)
+    } else if b >= KB {
+        format!("{:.2} KB", b / KB)
+    } else {
+        format!("{} bytes", bytes)
+    }
 }
 
 /// # Safety
@@ -163,10 +193,8 @@ unsafe extern "C" fn read_athena_bind(bind_info: duckdb_bind_info) {
                 return;
             }
         };
-        // as_i32() returns 0 when the parameter is not provided (null value),
-        // which is distinct from an explicit 0 (which is also treated as DEFAULT_LIMIT
-        // since a limit of 0 rows is not meaningful for a scan).
-        let maxrows = bi.get_named_parameter_value("maxrows").as_i32();
+        let maxrows_val = bi.get_named_parameter_value("maxrows");
+        let maxrows = if maxrows_val.is_null() { 0 } else { maxrows_val.as_i32() };
         let database = {
             let db_val = bi.get_named_parameter_value("database").as_str();
             match db_val {
@@ -196,6 +224,13 @@ unsafe extern "C" fn read_athena_bind(bind_info: duckdb_bind_info) {
                             let type_id = map_type(type_str).unwrap_or(TypeId::Varchar);
                             bi.add_result_column(column.name(), type_id);
                         }
+                    }
+                    // Partition columns come after data columns in Athena's SELECT * results.
+                    // Registering them here keeps the DuckDB chunk column count in sync.
+                    for column in table.partition_keys() {
+                        let type_str = column.r#type().unwrap_or("varchar").to_string();
+                        let type_id = map_type(type_str).unwrap_or(TypeId::Varchar);
+                        bi.add_result_column(column.name(), type_id);
                     }
                 }
             }
@@ -296,9 +331,7 @@ unsafe extern "C" fn read_athena_init(info: duckdb_init_info) {
                     return;
                 }
                 _ => {
-                    if let Some(millis) = total_execution_time(&resp) {
-                        println!("Total execution time: {} millis", millis);
-                    }
+                    print_query_stats(&resp);
 
                     // Collect all pages from the paginator
                     let mut pages: Vec<GetQueryResultsOutput> = Vec::new();

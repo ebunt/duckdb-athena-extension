@@ -22,4 +22,4 @@ fn register_functions(con: duckdb_connection) -> Result<(), ExtensionError> {
     unsafe { builder.register(con) }
 }
 
-entry_point!(athena_init_c_api, |con| register_functions(con));
+entry_point!(duckdb_athena_init_c_api, |con| register_functions(con));
