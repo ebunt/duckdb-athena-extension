@@ -20,10 +20,15 @@ Query Amazon Athena tables directly from DuckDB using `athena_scan`.
 
 Clone the repository and build with Cargo:
 
+1. This does not work unless you rename the file to `duckdb_extension`
 ```bash
 git clone https://github.com/ebunt/duckdb-athena-extension.git
 cd duckdb-athena-extension
 cargo build --release
+```
+2. Instead, this is wrapped in a `Makefile` - `USE THIS`
+```bash
+make
 ```
 
 The compiled extension is placed in `target/release/` with a platform-specific name:
