@@ -2,115 +2,127 @@
 
 > **WARNING** This is a work in progress - things may or may not work as expected 🧙‍♂️
 
+Query Amazon Athena tables directly from DuckDB using `athena_scan`.
+
 ## Limitations
 
-- Only the `default` database is supported
+- Only the `default` Glue database is supported
 - Not all data types are implemented yet
 - 10,000 results are returned by default (use `maxrows=-1` to return everything)
-- Pushdown predicates are not supported
+- Filter pushdown is not supported — the full table is always scanned
 
-## Getting started
+## Prerequisites
 
-The Athena extension is supported in DuckDB v0.7.0 and up. To install the extension, start duckdb with the `unsigned` parameter.
+- [Rust](https://rustup.rs/) stable toolchain (`rustup install stable`)
+- [DuckDB CLI](https://duckdb.org/docs/installation/) v1.4 or later
+- AWS credentials with permissions for Athena, Glue, and S3
 
-```
-> duckdb -unsigned
-v1.1.1 af39bd0dcf
-D 
-```
+## Building from source
 
-The first time you use the extension, you need to install it from a custom repository. 
-
-```
-SET custom_extension_repository='d2j9pg7mqm9we6.cloudfront.net/athena/latest';
-INSTALL athena;
-```
-
-Then LOAD the extension. You only need to run the INSTALL command once.
-
-```
-LOAD athena;
-```
-
-You can now extract data from tables in your default data catalog.
-
-```
-select * from athena_scan("noaa_gsod_pds", "s3://results-bucket/prefix");
-```
-
-> **Warning** To prevent runaway queries, the extension only returns 10,000 rows by default. If you'd like to return everything, you can add `maxrows=-1` as a parameter inside the function.
-
-```
-select * from athena_scan("noaa_gsod_pds", "s3://results-bucket/prefix", maxrows=-1);
-```
-
-Filter pushdown is not yet supported so the extension will scan the entire table.
-
-> **Note** The extension uses your environment variables to figure out region and credentials. Make sure to have your access key/secret set.
-
-## Development
-
-- Clone the repo with submodules
+Clone the repository and build with Cargo:
 
 ```bash
-git clone https://github.com/dacort/duckdb-athena-extension.git --recurse-submodules
-```
-
-- Build
-
-```bash
+git clone https://github.com/ebunt/duckdb-athena-extension.git
 cd duckdb-athena-extension
-make
+cargo build --release
 ```
 
-- Start up duckdb with the `-unsigned` parameter and your desired AWS_REGION
+The compiled extension is placed in `target/release/` with a platform-specific name:
+
+| Platform | File |
+|---|---|
+| Linux | `target/release/libduckdb_athena.so` |
+| macOS | `target/release/libduckdb_athena.dylib` |
+| Windows | `target/release/duckdb_athena.dll` |
+
+## AWS credentials
+
+The extension reads AWS credentials and region from the standard environment variables:
 
 ```bash
-AWS_REGION=us-east-1 build/debug/duckdb -unsigned
+export AWS_ACCESS_KEY_ID=<your-access-key>
+export AWS_SECRET_ACCESS_KEY=<your-secret-key>
+export AWS_REGION=us-east-1
 ```
+
+Any credential source supported by the AWS SDK (instance profile, SSO, `~/.aws/credentials`, etc.) also works.
+
+The IAM principal needs at minimum:
+- `athena:StartQueryExecution`, `athena:GetQueryExecution`, `athena:GetQueryResults`
+- `glue:GetTable` on the target table
+- `s3:PutObject` / `s3:GetObject` on the S3 results bucket
+
+## Loading the extension
+
+DuckDB must be started with the `-unsigned` flag to load locally built extensions:
 
 ```bash
-v1.1.1 af39bd0dcf
-Enter ".help" for usage hints.
-D 
+AWS_REGION=us-east-1 duckdb -unsigned
 ```
 
-- Load the extension
-
-```
-load 'build/debug/extension/athena/athena.duckdb_extension';
-```
-
-- Query a single table, also providing where S3 results are written to
+Then load the extension file (adjust the path and filename for your platform):
 
 ```sql
-select * from athena_scan('table_name', 's3://<bucket>/athena-results/');
+-- Linux
+LOAD 'target/release/libduckdb_athena.so';
+
+-- macOS
+LOAD 'target/release/libduckdb_athena.dylib';
+
+-- Windows
+LOAD 'target/release/duckdb_athena.dll';
 ```
 
-> **Warning**: 10,000 results will be returned by default! Use `maxrows=-1` to return the entire table.
+## Usage
+
+### Basic query
+
+Provide the Glue table name and an S3 path where Athena should write query results:
+
+```sql
+SELECT * FROM athena_scan('my_table', 's3://my-results-bucket/prefix/');
+```
+
+### Return all rows
+
+By default only the first 10,000 rows are returned. Pass `maxrows=-1` to remove the limit:
+
+```sql
+SELECT * FROM athena_scan('my_table', 's3://my-results-bucket/prefix/', maxrows=-1);
+```
+
+### Filter after scanning
+
+Filter pushdown is not yet supported, so add WHERE clauses in DuckDB after the scan:
+
+```sql
+SELECT * FROM athena_scan('my_table', 's3://my-results-bucket/prefix/', maxrows=-1)
+WHERE year = 2024;
+```
+
+## Testing
+
+There are no automated unit tests in this repository yet. To verify the extension works end-to-end:
+
+1. Build the extension as described above.
+2. Export your AWS credentials and region.
+3. Start DuckDB with `-unsigned` and load the extension.
+4. Run a query against a known table in your default Glue catalog:
+
+```sql
+SELECT COUNT(*) FROM athena_scan('my_table', 's3://my-results-bucket/prefix/');
+```
+
+You should see console output like:
 
 ```
-D select * from athena_scan("amazon_reviews_parquet");
 Running Athena query, execution id: 152a20c7-ff32-4a19-bb71-ae0135373ca6
-State: Queued, sleep 5 secs ...
+State: Running, sleeping 5 secs...
 Total execution time: 1307 millis
-100% ▕████████████████████████████████████████████████████████████▏ 
-┌─────────────┬─────────────┬────────────────┬────────────┬────────────────┬───┬─────────┬───────────────────┬──────────────────────┬──────────────────────┬─────────────────┬───────┐
-│ marketplace │ customer_id │   review_id    │ product_id │ product_parent │ … │  vine   │ verified_purchase │   review_headline    │     review_body      │   review_date   │ year  │
-│   varchar   │   varchar   │    varchar     │  varchar   │    varchar     │   │ varchar │      varchar      │       varchar        │       varchar        │      int64      │ int32 │
-├─────────────┼─────────────┼────────────────┼────────────┼────────────────┼───┼─────────┼───────────────────┼──────────────────────┼──────────────────────┼─────────────────┼───────┤
-│ US          │ 37441986    │ R2H287L0BUP89U │ B00CT780C2 │ 473048287      │ … │ N       │ Y                 │ Perfect Gift         │ I love giving my s…  │ 140454171422720 │     0 │
-│ US          │ 20676035    │ R1222MJHP5QWXE │ B004LLILFA │ 361255549      │ … │ N       │ Y                 │ Five Stars           │ Great gift for out…  │           16170 │  2014 │
-│ US          │ 45090731    │ R32ECJRNTB61K8 │ B004LLIL4G │ 307223063      │ … │ N       │ Y                 │ happy birthday card  │ gift cards from Am…  │ 140454171423232 │     0 │
-│ US          │ 2207141     │ RLTEU3JZ1IJAA  │ B004LLILDM │ 87389551       │ … │ N       │ Y                 │ Five Stars           │ gracias.             │           16391 │  2014 │
-│ US          │ 15258       │ R1ZAX1TN66QOU6 │ B004LLIKVU │ 473048287      │ … │ N       │ Y                 │ easy breezy          │ gift card was sent…  │ 140454171424000 │     0 │
-│ ·           │    ·        │       ·        │     ·      │    ·           │ · │ ·       │ ·                 │     ·                │    ·                 │             ·   │    ·  │
-├─────────────┴─────────────┴────────────────┴────────────┴────────────────┴───┴─────────┴───────────────────┴──────────────────────┴──────────────────────┴─────────────────┴───────┤
-│ 999 rows (40 shown)                                                                                                                                          15 columns (11 shown) │
-└────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
+
+followed by the result set.
 
 ## Credits
 
-- Initial rust DuckDB Extension Framework: https://github.com/Mause/duckdb_extension-framework
-- Updated rust extension framework: https://github.com/eto-ai/lance/tree/main/integration/duckdb_lance
+- Rust DuckDB extension FFI: https://github.com/ywilkof/quack-rs
