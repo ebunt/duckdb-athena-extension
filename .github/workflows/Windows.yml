@@ -7,71 +7,47 @@ defaults:
   run:
     shell: bash
 
-# TODO: checkout duckdb_athena_rust/duckdb
-
 jobs:
   windows:
-    name: Release
+    name: Windows Release
     runs-on: windows-latest
-    # These permissions are needed to interact with GitHub's OIDC Token endpoint.
     permissions:
       id-token: write
-    strategy:
-      matrix:
-        # Add commits/tags to build against other DuckDB versions
-        duckdb_version: [ '<submodule_version>' ]
 
     steps:
-      - uses: actions/checkout@v3
-        with:
-          fetch-depth: 0
-          submodules: 'true'
+      - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v2
-        with:
-          python-version: '3.7'
-
-      - name: Checkout DuckDB to version
-        # Add commits/tags to build against other DuckDB versions
-        if: ${{ matrix.duckdb_version != '<submodule_version>'}}
-        run: |
-          cd duckdb
-          git checkout ${{ matrix.duckdb_version }}
-          cd ../duckdb_athena_rust/duckdb
-          git checkout ${{ matrix.duckdb_version }}
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Build extension
         run: |
-          dir duckdb_athena_rust/duckdb/src/include
-          make release
+          cargo build --release
+          cp target/release/duckdb_athena.dll athena.duckdb_extension
 
-      - uses: actions/upload-artifact@v2
+      - uses: actions/upload-artifact@v4
         with:
-          name: linux-extensions-64-aarch64
-          path: |
-            build/release/extension/duckdb-athena-extension/athena.duckdb_extension
+          name: windows_amd64-extensions
+          path: athena.duckdb_extension
 
-      - name: configure aws credentials
-        uses: aws-actions/configure-aws-credentials@v1
+      - name: Configure AWS credentials
+        if: ${{ env.OIDC_ROLE_ARN != '' }}
+        uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.OIDC_ROLE_ARN }}
           aws-region: ${{ secrets.S3_REGION }}
+        env:
+          OIDC_ROLE_ARN: ${{ secrets.OIDC_ROLE_ARN }}
 
       - name: Deploy
+        if: ${{ env.BUCKET_NAME != '' && (startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main') }}
         env:
           BUCKET_NAME: ${{ secrets.S3_BUCKET }}
         run: |
-          cd duckdb
-          git fetch --tags
-          export DUCKDB_VERSION=`git tag --points-at HEAD`
-          export DUCKDB_VERSION=${DUCKDB_VERSION:=`git log -1 --format=%h`}
-          cd ..
-          if [[ "$BUCKET_NAME" == "" ]] ; then
-            echo 'No bucket set, skipping'
-          elif [[ "$GITHUB_REF" =~ ^(refs/tags/v.+)$ ]] ; then
-            python -m pip install awscli
-            ./scripts/extension-upload.sh athena ${{ github.ref_name }} $DUCKDB_VERSION windows_amd64 $BUCKET_NAME true 
-          elif [[ "$GITHUB_REF" =~ ^(refs/heads/main)$ ]] ; then
-            python -m pip install awscli
-            ./scripts/extension-upload.sh athena `git log -1 --format=%h` $DUCKDB_VERSION windows_amd64 $BUCKET_NAME false 
+          EXTENSION_VERSION=${{ github.ref_name }}
+          if [[ "$GITHUB_REF" =~ ^(refs/heads/main)$ ]]; then
+            EXTENSION_VERSION=$(git log -1 --format=%h)
           fi
+          aws s3 cp athena.duckdb_extension \
+            s3://${BUCKET_NAME}/duckdb-athena/${EXTENSION_VERSION}/windows_amd64/athena.duckdb_extension
+

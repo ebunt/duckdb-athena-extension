@@ -3,18 +3,24 @@ name = "duckdb-athena"
 version = "0.1.0"
 edition = "2021"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
 [dependencies]
-duckdb_athena_rust = { path = "./duckdb_athena_rust" }
-tokio = { version = "1.23.0", features=['full'] }
-aws-config = "0.54.1"
-aws-sdk-athena = "0.24.0"
-aws-sdk-glue = "0.24.0"
-lazy_static = "1.4.0"
-anyhow = { version = "1.0.68", features = ["backtrace"] }
+quack-rs = "0.11"
+libduckdb-sys = { version = ">=1.4.4, <2", features = ["loadable-extension"] }
+tokio = { version = "1", features = ["full"] }
+aws-config = "1"
+aws-sdk-athena = "1"
+aws-sdk-glue = "1"
+lazy_static = "1"
+anyhow = { version = "1", features = ["backtrace"] }
 futures = "0.3"
 
 [lib]
 name = "duckdb_athena"
-crate-type = ["staticlib"]
+crate-type = ["cdylib"]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
