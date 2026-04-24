@@ -6,7 +6,6 @@ Query Amazon Athena tables directly from DuckDB using `athena_scan`.
 
 ## Limitations
 
-- Only the `default` Glue database is supported
 - Not all data types are implemented yet
 - 10,000 results are returned by default (use `maxrows=-1` to return everything)
 - Filter pushdown is not supported — the full table is always scanned
@@ -81,6 +80,12 @@ Provide the Glue table name and an S3 path where Athena should write query resul
 
 ```sql
 SELECT * FROM athena_scan('my_table', 's3://my-results-bucket/prefix/');
+```
+
+By default the `default` Glue database is used. To query a table in a different database pass the `database` named parameter:
+
+```sql
+SELECT * FROM athena_scan('my_table', 's3://my-results-bucket/prefix/', database='my_database');
 ```
 
 ### Return all rows

@@ -23,14 +23,16 @@ const DEFAULT_LIMIT: i32 = 10000;
 
 struct ScanBindData {
     tablename: String,
+    database: String,
     output_location: String,
     limit: i32,
 }
 
 impl ScanBindData {
-    fn new(tablename: &str, output_location: &str, limit: i32) -> Self {
+    fn new(tablename: &str, database: &str, output_location: &str, limit: i32) -> Self {
         Self {
             tablename: tablename.to_owned(),
+            database: database.to_owned(),
             output_location: output_location.to_owned(),
             limit,
         }
@@ -165,6 +167,13 @@ unsafe extern "C" fn read_athena_bind(bind_info: duckdb_bind_info) {
         // which is distinct from an explicit 0 (which is also treated as DEFAULT_LIMIT
         // since a limit of 0 rows is not meaningful for a scan).
         let maxrows = bi.get_named_parameter_value("maxrows").as_i32();
+        let database = {
+            let db_val = bi.get_named_parameter_value("database").as_str();
+            match db_val {
+                Ok(s) if !s.trim().is_empty() => s.trim().to_owned(),
+                _ => "default".to_owned(),
+            }
+        };
 
         let config = crate::RUNTIME
             .block_on(aws_config::defaults(BehaviorVersion::latest()).load());
@@ -173,7 +182,7 @@ unsafe extern "C" fn read_athena_bind(bind_info: duckdb_bind_info) {
         let table_result = crate::RUNTIME.block_on(
             client
                 .get_table()
-                .database_name("default")
+                .database_name(database.clone())
                 .name(tablename.clone())
                 .send(),
         );
@@ -197,7 +206,7 @@ unsafe extern "C" fn read_athena_bind(bind_info: duckdb_bind_info) {
         }
 
         let limit = if maxrows > 0 { maxrows } else { DEFAULT_LIMIT };
-        FfiBindData::<ScanBindData>::set(bind_info, ScanBindData::new(&tablename, &output_location, limit));
+        FfiBindData::<ScanBindData>::set(bind_info, ScanBindData::new(&tablename, &database, &output_location, limit));
     }
 }
 
@@ -211,6 +220,7 @@ unsafe extern "C" fn read_athena_init(info: duckdb_init_info) {
         };
 
         let tablename = bind_data.tablename.clone();
+        let database = bind_data.database.clone();
         let output_location = bind_data.output_location.clone();
         let maxrows = bind_data.limit;
 
@@ -222,7 +232,8 @@ unsafe extern "C" fn read_athena_init(info: duckdb_init_info) {
             .output_location(output_location)
             .build();
 
-        let mut query = format!("SELECT * FROM {}", tablename);
+        let qualified_table = format!("\"{}\".\"{}\"", database.replace('"', ""), tablename.replace('"', ""));
+        let mut query = format!("SELECT * FROM {}", qualified_table);
         if maxrows > 0 {
             query = format!("{} LIMIT {}", query, maxrows);
         }
@@ -323,6 +334,7 @@ pub fn build_table_function_def() -> TableFunctionBuilder {
         .param(TypeId::Varchar)
         .param(TypeId::Varchar)
         .named_param("maxrows", TypeId::Integer)
+        .named_param("database", TypeId::Varchar)
         .bind(read_athena_bind)
         .init(read_athena_init)
         .scan(read_athena)
