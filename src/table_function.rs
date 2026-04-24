@@ -1,426 +1,330 @@
-use anyhow::{anyhow, Result};
-use aws_sdk_athena::model::ResultSetMetadata;
-use aws_sdk_athena::types::SdkError;
-use aws_sdk_athena::{error::GetQueryResultsError, model::Row};
-use aws_sdk_glue::model::Logical;
-use futures::{executor::block_on, Stream};
-use std::os::fd::IntoRawFd;
-use std::ptr::null;
-use std::{
-    ffi::{c_void, CStr, CString},
-    os::raw::c_char,
-    pin::Pin,
-    task::{Context, Poll},
-    thread,
-};
-
+use aws_config::BehaviorVersion;
 use aws_sdk_athena::{
-    model::{
+    operation::get_query_execution::GetQueryExecutionOutput,
+    operation::get_query_results::GetQueryResultsOutput,
+    types::{
         QueryExecutionState::{self, *},
-        ResultConfiguration, ResultSet,
+        ResultConfiguration, ResultSetMetadata, Row,
     },
-    output::{GetQueryExecutionOutput, GetQueryResultsOutput},
-    paginator::GetQueryResultsPaginator,
     Client as AthenaClient,
 };
 use aws_sdk_glue::Client as GlueClient;
-use duckdb_athena_rust::table_function::{BindInfo, InitInfo, TableFunction};
-use duckdb_athena_rust::{
-    duckdb_bind_info, duckdb_data_chunk, duckdb_free, duckdb_function_info, duckdb_init_info,
-    malloc_struct,
+use libduckdb_sys::{duckdb_data_chunk, duckdb_data_chunk_set_size, duckdb_bind_info, duckdb_function_info, duckdb_function_set_error, duckdb_init_info, idx_t};
+use quack_rs::{
+    table::{BindInfo, FfiBindData, FfiInitData, TableFunctionBuilder},
+    types::TypeId,
 };
-use duckdb_athena_rust::{DataChunk, FunctionInfo, LogicalType, LogicalTypeId};
-
-use tokio::{runtime::Runtime, time::Duration};
+use std::{ffi::CString, thread};
+use tokio::time::Duration;
 
 use crate::types::{map_type, populate_column};
 
-#[repr(C)]
+const DEFAULT_LIMIT: i32 = 10000;
+
 struct ScanBindData {
-    /// Athena table name and query result output location
-    tablename: *mut c_char,
-    output_location: *mut c_char,
+    tablename: String,
+    output_location: String,
     limit: i32,
 }
 
-const DEFAULT_LIMIT: i32 = 10000;
-
 impl ScanBindData {
-    fn new(tablename: &str, output_location: &str) -> Self {
+    fn new(tablename: &str, output_location: &str, limit: i32) -> Self {
         Self {
-            tablename: CString::new(tablename).expect("Table name").into_raw(),
-            output_location: CString::new(output_location)
-                .expect("S3 output location")
-                .into_raw(),
-            limit: DEFAULT_LIMIT as i32,
+            tablename: tablename.to_owned(),
+            output_location: output_location.to_owned(),
+            limit,
         }
     }
 }
 
-/// Drop the ScanBindData from C.
-///
-/// # Safety
-unsafe extern "C" fn drop_scan_bind_data_c(v: *mut c_void) {
-    let actual = v.cast::<ScanBindData>();
-    drop(CString::from_raw((*actual).tablename.cast()));
-    drop(CString::from_raw((*actual).output_location.cast()));
-    drop((*actual).limit);
-    duckdb_free(v);
-}
-
-struct ResultStream {
-    stream:
-        Pin<Box<dyn Stream<Item = Result<GetQueryResultsOutput, SdkError<GetQueryResultsError>>>>>,
-}
-
-impl ResultStream {
-    pub fn new(
-        stream: Box<
-            dyn Stream<Item = Result<GetQueryResultsOutput, SdkError<GetQueryResultsError>>>,
-        >,
-    ) -> Self {
-        Self {
-            stream: stream.into(),
-        }
-    }
-}
-
-impl Stream for ResultStream {
-    type Item = Result<GetQueryResultsOutput, SdkError<GetQueryResultsError>>;
-
-    // https://stackoverflow.com/questions/72926989/how-to-implement-trait-futuresstreamstream was ridiculously helpful
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        match self.get_mut().stream.as_mut().poll_next(cx) {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(v) => {
-                // Do what you need to do with v here.
-                Poll::Ready(v)
-            }
-        }
-    }
-}
-#[repr(C)]
 struct ScanInitData {
-    stream: *mut ResultStream,
-    pagination_index: u32,
+    pages: Vec<GetQueryResultsOutput>,
+    current_page: usize,
     done: bool,
 }
 
 impl ScanInitData {
-    fn new(stream: Box<ResultStream>) -> Self {
+    fn new(pages: Vec<GetQueryResultsOutput>) -> Self {
         Self {
-            stream: Box::into_raw(stream),
+            pages,
+            current_page: 0,
             done: false,
-            pagination_index: 0,
         }
     }
 }
 
 /// # Safety
-///
-/// .
 #[no_mangle]
 unsafe extern "C" fn read_athena(info: duckdb_function_info, output: duckdb_data_chunk) {
-    let info = FunctionInfo::from(info);
-    let mut output = DataChunk::from(output);
+    unsafe {
+        let init_data = FfiInitData::<ScanInitData>::get_mut(info);
+        if let Some(state) = init_data {
+            if state.done || state.current_page >= state.pages.len() {
+                duckdb_data_chunk_set_size(output, 0);
+                state.done = true;
+                return;
+            }
 
-    let init_data = info.init_data::<ScanInitData>();
-    // if (*init_data).done {
-    //     output.set_len(0);
-    //     return;
-    // }
+            let page = &state.pages[state.current_page];
+            if let Some(rs) = page.result_set() {
+                let rows = rs.rows();
+                // Athena returns the column header in the first page's first row
+                let rows_slice: &[Row] = if state.current_page == 0 && !rows.is_empty() {
+                    &rows[1..]
+                } else {
+                    rows
+                };
 
-    let batch = match crate::RUNTIME
-        .block_on(async { futures::StreamExt::next(&mut (*(*init_data).stream).stream).await })
-    {
-        Some(Ok(b)) => Some(b),
-        Some(Err(e)) => {
-            info.set_error(duckdb_athena_rust::Error::DuckDB(e.to_string()));
-            return;
+                if let Some(metadata) = rs.result_set_metadata() {
+                    if let Err(e) = result_set_to_duckdb_data_chunk(rows_slice, metadata, output) {
+                        let msg = CString::new(e.to_string()).unwrap_or_default();
+                        duckdb_function_set_error(info, msg.as_ptr());
+                        duckdb_data_chunk_set_size(output, 0);
+                        state.done = true;
+                        return;
+                    }
+                } else {
+                    duckdb_data_chunk_set_size(output, 0);
+                    state.done = true;
+                }
+            } else {
+                duckdb_data_chunk_set_size(output, 0);
+                state.done = true;
+            }
+            state.current_page += 1;
+        } else {
+            duckdb_data_chunk_set_size(output, 0);
         }
-        None => None,
-    };
-
-    if let Some(b) = batch {
-        let mut rows = b.result_set().unwrap().rows().unwrap();
-        // Athena returns the header in the results 0_o but only in the first page
-        if (*init_data).pagination_index == 0 {
-            rows = &rows[1..];
-        }
-        let metadata = b.result_set().unwrap().result_set_metadata().unwrap();
-        result_set_to_duckdb_data_chunk(rows, metadata, &mut output)
-            .expect("Couldn't write results");
-    } else {
-        (*init_data).done = true;
-        output.set_len(0);
     }
-
-    (*init_data).pagination_index += 1;
 }
 
 pub fn result_set_to_duckdb_data_chunk(
     rows: &[Row],
     metadata: &ResultSetMetadata,
-    chunk: &DataChunk,
-) -> Result<()> {
-    // Fill the row
-    // This is asserting the wrong thing (row length vs. column length)
-    // assert!_eq!(rs.rows().unwrap().len(), chunk.num_columns());
-    // let rows = &rs.rows().unwrap()[1..];
+    chunk: duckdb_data_chunk,
+) -> anyhow::Result<()> {
     let result_size = rows.len();
 
     for row_idx in 0..result_size {
         let row = &rows[row_idx];
-        let row_data = row.data().unwrap();
+        let row_data = row.data();
         for col_idx in 0..row_data.len() {
-            let value = row_data[col_idx].var_char_value().unwrap();
-            let colinfo = &metadata.column_info().unwrap()[col_idx];
-            let ddb_type = map_type(colinfo.r#type().unwrap().to_string()).unwrap();
-            unsafe { populate_column(value, ddb_type, chunk, row_idx, col_idx) };
+            let value = row_data[col_idx].var_char_value().unwrap_or("");
+            let col_infos = metadata.column_info();
+            if col_idx < col_infos.len() {
+                let col_type_str = col_infos[col_idx].r#type().to_string();
+                let ddb_type = map_type(col_type_str).unwrap_or(TypeId::Varchar);
+                unsafe { populate_column(value, ddb_type, chunk, row_idx, col_idx) };
+            }
         }
     }
 
-    chunk.set_len(result_size);
+    unsafe { duckdb_data_chunk_set_size(chunk, result_size as idx_t) };
 
     Ok(())
 }
 
-fn status(resp: &GetQueryExecutionOutput) -> Option<&QueryExecutionState> {
-    resp.query_execution().unwrap().status().unwrap().state()
+fn status(resp: &GetQueryExecutionOutput) -> Option<QueryExecutionState> {
+    resp.query_execution()
+        .and_then(|qe| qe.status())
+        .and_then(|s| s.state())
+        .cloned()
 }
 
 fn total_execution_time(resp: &GetQueryExecutionOutput) -> Option<i64> {
     resp.query_execution()
-        .unwrap()
-        .statistics()
-        .unwrap()
-        .total_execution_time_in_millis()
-}
-
-async fn get_query_result(client: &AthenaClient, query_execution_id: String) -> Result<ResultSet> {
-    let resp = anyhow::Context::with_context(
-        client
-            .get_query_results()
-            .set_query_execution_id(Some(query_execution_id.clone()))
-            .send()
-            .await,
-        || {
-            format!(
-                "could not get query results for query id {}",
-                query_execution_id
-            )
-        },
-    )?;
-
-    Ok(resp
-        .result_set()
-        .ok_or_else(|| anyhow!("could not get query result"))?
-        .clone())
-}
-
-async fn get_query_result_paginator(
-    client: &AthenaClient,
-    query_execution_id: String,
-) -> GetQueryResultsPaginator {
-    client
-        .get_query_results()
-        .set_query_execution_id(Some(query_execution_id.clone()))
-        .into_paginator()
+        .and_then(|qe| qe.statistics())
+        .and_then(|s| s.total_execution_time_in_millis())
 }
 
 /// # Safety
-///
-/// .
 #[no_mangle]
 unsafe extern "C" fn read_athena_bind(bind_info: duckdb_bind_info) {
-    let bind_info = BindInfo::from(bind_info);
-    assert!(bind_info.num_parameters()>= 2);
-
-    let tablename = bind_info.parameter(0);
-    let output_location = bind_info.parameter(1);
-    let maxrows = bind_info.named_parameter("maxrows");
-    // let maxrowsd = bind_info.named_parameter("maxrowsd");
-    // println!("Maxrowsd is: {:?}", maxrowsd);
-
-    // How oh how to get named parameters? I don't know!
-    // But postgres does https://github.com/duckdblabs/postgres_scanner/blob/main/postgres_scanner.cpp#LL1059C18-L1059C23
-
-    // Table name is the first param that's getting passed in
-    // We need to go to the Glue Data Catalog and fetch the column tables for that table.
-    // For now, we only support the `default` table.
-    let config = block_on(aws_config::load_from_env());
-    let client = GlueClient::new(&config);
-
-    let table = client
-        .get_table()
-        .database_name("default")
-        .name(tablename.to_string())
-        .send();
-
-    match crate::RUNTIME.block_on(table) {
-        Ok(resp) => {
-            let columns = resp
-                .table()
-                .unwrap()
-                .storage_descriptor()
-                .unwrap()
-                .columns();
-            for column in columns.unwrap() {
-                let typ = LogicalType::new(
-                    map_type(column.r#type().unwrap_or("varchar").to_string())
-                        .expect("Could not get type"),
-                );
-                bind_info.add_result_column(column.name().unwrap(), typ);
-            }
-        }
-        Err(err) => {
-            bind_info.set_error(duckdb_athena_rust::Error::DuckDB(
-                err.into_service_error().to_string(),
-            ));
+    unsafe {
+        let bi = BindInfo::new(bind_info);
+        if bi.parameter_count() < 2 {
+            bi.set_error("athena_scan requires at least 2 parameters: tablename, output_location");
             return;
         }
-    }
 
-    unsafe {
-        let bind_data = malloc_struct::<ScanBindData>();
-        (*bind_data).tablename = CString::new(tablename.to_string())
-            .expect("Table name")
-            .into_raw();
-        (*bind_data).output_location = CString::new(output_location.to_string())
-            .expect("S3 output location")
-            .into_raw();
+        let tablename = match bi.get_parameter_value(0).as_str() {
+            Ok(s) => s,
+            Err(e) => {
+                bi.set_error(&e.to_string());
+                return;
+            }
+        };
+        let output_location = match bi.get_parameter_value(1).as_str() {
+            Ok(s) => s,
+            Err(e) => {
+                bi.set_error(&e.to_string());
+                return;
+            }
+        };
+        // as_i32() returns 0 when the parameter is not provided (null value),
+        // which is distinct from an explicit 0 (which is also treated as DEFAULT_LIMIT
+        // since a limit of 0 rows is not meaningful for a scan).
+        let maxrows = bi.get_named_parameter_value("maxrows").as_i32();
 
-        if !maxrows.is_null() {
-            let lv = maxrows.to_string().parse::<i32>().unwrap();
-            (*bind_data).limit = lv;
-        } else {
-            (*bind_data).limit = DEFAULT_LIMIT;
+        let config = crate::RUNTIME
+            .block_on(aws_config::defaults(BehaviorVersion::latest()).load());
+        let client = GlueClient::new(&config);
+
+        let table_result = crate::RUNTIME.block_on(
+            client
+                .get_table()
+                .database_name("default")
+                .name(tablename.clone())
+                .send(),
+        );
+
+        match table_result {
+            Ok(resp) => {
+                if let Some(table) = resp.table() {
+                    if let Some(sd) = table.storage_descriptor() {
+                        for column in sd.columns() {
+                            let type_str = column.r#type().unwrap_or("varchar").to_string();
+                            let type_id = map_type(type_str).unwrap_or(TypeId::Varchar);
+                            bi.add_result_column(column.name(), type_id);
+                        }
+                    }
+                }
+            }
+            Err(err) => {
+                bi.set_error(&err.into_service_error().to_string());
+                return;
+            }
         }
 
-        bind_info.set_bind_data(bind_data.cast(), Some(drop_scan_bind_data_c));
+        let limit = if maxrows > 0 { maxrows } else { DEFAULT_LIMIT };
+        FfiBindData::<ScanBindData>::set(bind_info, ScanBindData::new(&tablename, &output_location, limit));
     }
 }
 
 /// # Safety
-///
-/// .
-/// Creates the initial Athena query and waits for it to be done.
 #[no_mangle]
 unsafe extern "C" fn read_athena_init(info: duckdb_init_info) {
-    let info = InitInfo::from(info);
-    let bind_info = info.bind_data::<ScanBindData>();
-    // assert_eq!(bind_info.num_parameters(), 2);
+    unsafe {
+        let bind_data = match FfiBindData::<ScanBindData>::get_from_init(info) {
+            Some(d) => d,
+            None => return,
+        };
 
-    // Extract the table name and output location from
-    let tablename = CStr::from_ptr((*bind_info).tablename).to_str().unwrap();
-    let output_location = CStr::from_ptr((*bind_info).output_location)
-        .to_str()
-        .unwrap();
-    let maxrows = (*bind_info).limit;
+        let tablename = bind_data.tablename.clone();
+        let output_location = bind_data.output_location.clone();
+        let maxrows = bind_data.limit;
 
-    let config = block_on(aws_config::load_from_env());
-    let client = AthenaClient::new(&config);
-    let result_config = ResultConfiguration::builder()
-        .set_output_location(Some(output_location.to_owned()))
-        .build();
+        let config = crate::RUNTIME
+            .block_on(aws_config::defaults(BehaviorVersion::latest()).load());
+        let client = AthenaClient::new(&config);
 
-    let mut query = format!("SELECT * FROM {}", tablename);
-    if maxrows >= 0 {
-        query = format!("{} LIMIT {}", query, maxrows);
-    }
+        let result_config = ResultConfiguration::builder()
+            .output_location(output_location)
+            .build();
 
-    let athena_query = client
-        .start_query_execution()
-        .set_query_string(Some(query))
-        .set_result_configuration(Some(result_config))
-        .set_work_group(Some("primary".to_string()))
-        .send();
+        let mut query = format!("SELECT * FROM {}", tablename);
+        if maxrows > 0 {
+            query = format!("{} LIMIT {}", query, maxrows);
+        }
 
-    // TODO: Use unwrap_or maybe? Docs recommend not to use this because it can panic.
-    let resp = crate::RUNTIME
-        .block_on(athena_query)
-        .expect("could not start query");
+        let start_resp = crate::RUNTIME.block_on(
+            client
+                .start_query_execution()
+                .query_string(query)
+                .result_configuration(result_config)
+                .work_group("primary")
+                .send(),
+        );
 
-    let query_execution_id = resp.query_execution_id().unwrap_or_default();
-    println!(
-        "Running Athena query, execution id: {}",
-        &query_execution_id
-    );
-
-    let mut state: QueryExecutionState;
-
-    loop {
-        let get_query = client
-            .get_query_execution()
-            .set_query_execution_id(Some(query_execution_id.to_string()))
-            .send();
-
-        let resp = crate::RUNTIME
-            .block_on(get_query)
-            .expect("Could not get query status");
-        state = status(&resp).expect("could not get query status").clone();
-
-        match state {
-            Queued | Running => {
-                thread::sleep(Duration::from_secs(5));
-                println!("State: {:?}, sleep 5 secs ...", state);
+        let query_execution_id = match start_resp {
+            Ok(r) => r.query_execution_id().unwrap_or_default().to_string(),
+            Err(e) => {
+                let msg = CString::new(e.to_string()).unwrap_or_default();
+                libduckdb_sys::duckdb_init_set_error(info, msg.as_ptr());
+                return;
             }
-            Cancelled | Failed => {
-                println!("State: {:?}", state);
+        };
 
-                match crate::RUNTIME
-                    .block_on(get_query_result(&client, query_execution_id.to_string()))
-                {
-                    Ok(result) => println!("Result: {:?}", result),
-                    Err(e) => println!("Result error: {:?}", e),
+        println!("Running Athena query, execution id: {}", &query_execution_id);
+
+        loop {
+            let get_resp = crate::RUNTIME.block_on(
+                client
+                    .get_query_execution()
+                    .query_execution_id(query_execution_id.clone())
+                    .send(),
+            );
+
+            let resp = match get_resp {
+                Ok(r) => r,
+                Err(e) => {
+                    let msg = CString::new(e.to_string()).unwrap_or_default();
+                    libduckdb_sys::duckdb_init_set_error(info, msg.as_ptr());
+                    return;
                 }
+            };
 
-                break;
-            }
-            _ => {
-                let millis = total_execution_time(&resp).unwrap();
-                println!("Total execution time: {} millis", millis);
+            let state = match status(&resp) {
+                Some(s) => s,
+                None => {
+                    let msg = CString::new("Could not get query state").unwrap_or_default();
+                    libduckdb_sys::duckdb_init_set_error(info, msg.as_ptr());
+                    return;
+                }
+            };
 
-                // let stream = match crate::RUNTIME.block_on(async {
-                //     let paginator = get_query_result_paginator(&client, query_execution_id.to_string()).await;
-                //     let results = paginator.send();
-                //     results
-                // }) {
-                //     Ok(s) => Box::new(s),
-                // };
-                let paginator = crate::RUNTIME.block_on(async {
-                    get_query_result_paginator(&client, query_execution_id.to_string()).await
-                });
-                let stream = paginator.send();
+            match state {
+                Queued | Running => {
+                    thread::sleep(Duration::from_secs(5));
+                    println!("State: {:?}, sleeping 5 secs...", state);
+                }
+                Cancelled | Failed => {
+                    let msg = format!("Query {:?}: {}", state, query_execution_id);
+                    let c_msg = CString::new(msg).unwrap_or_default();
+                    libduckdb_sys::duckdb_init_set_error(info, c_msg.as_ptr());
+                    return;
+                }
+                _ => {
+                    if let Some(millis) = total_execution_time(&resp) {
+                        println!("Total execution time: {} millis", millis);
+                    }
 
-                let init_data = Box::new(ScanInitData::new(Box::new(ResultStream::new(Box::new(
-                    stream,
-                )))));
-                info.set_init_data(Box::into_raw(init_data).cast(), Some(duckdb_free));
-                break;
+                    // Collect all pages from the paginator
+                    let mut pages: Vec<GetQueryResultsOutput> = Vec::new();
+                    let mut paginator = client
+                        .get_query_results()
+                        .query_execution_id(query_execution_id.clone())
+                        .into_paginator()
+                        .send();
+
+                    loop {
+                        let next = crate::RUNTIME.block_on(paginator.next());
+                        match next {
+                            Some(Ok(page)) => pages.push(page),
+                            Some(Err(e)) => {
+                                let msg = CString::new(e.to_string()).unwrap_or_default();
+                                libduckdb_sys::duckdb_init_set_error(info, msg.as_ptr());
+                                return;
+                            }
+                            None => break,
+                        }
+                    }
+
+                    FfiInitData::<ScanInitData>::set(info, ScanInitData::new(pages));
+                    break;
+                }
             }
         }
     }
 }
 
-pub fn build_table_function_def() -> TableFunction {
-    let table_function = TableFunction::new("athena_scan");
-    let logical_type = LogicalType::new(LogicalTypeId::Varchar);
-    let int_type = LogicalType::new(LogicalTypeId::Integer);
-    table_function.add_parameter(&logical_type);
-    table_function.add_parameter(&logical_type);
-    // table_function.add_parameter(&int_type);
-    // For some reason, we can't use limit here...
-    table_function.add_named_parameter("maxrows", &int_type);
-
-    table_function.set_function(Some(read_athena));
-    table_function.set_init(Some(read_athena_init));
-    table_function.set_bind(Some(read_athena_bind));
-    table_function
+pub fn build_table_function_def() -> TableFunctionBuilder {
+    TableFunctionBuilder::new("athena_scan")
+        .param(TypeId::Varchar)
+        .param(TypeId::Varchar)
+        .named_param("maxrows", TypeId::Integer)
+        .bind(read_athena_bind)
+        .init(read_athena_init)
+        .scan(read_athena)
 }
 
-lazy_static::lazy_static! {
-    static ref RUNTIME: Runtime = tokio::runtime::Builder::new_current_thread()
-            .build()
-            .expect("runtime");
-}

@@ -7,151 +7,65 @@ defaults:
   run:
     shell: bash
 
-# TODO: Add rust, checkout duckdb_athena_rust/duckdb
-
 jobs:
   linux:
     name: Linux Release
     runs-on: ubuntu-latest
-    # These permissions are needed to interact with GitHub's OIDC Token endpoint.
     permissions:
       id-token: write
-    container: ${{ matrix.container }}
     strategy:
       matrix:
-        # Add commits/tags to build against other DuckDB versions
-        duckdb_version: [ '<submodule_version>' ]
-        arch: ['linux_amd64', 'linux_arm64'] # , 'linux_amd64_gcc4'
+        target: [x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu]
         include:
-          - arch: 'linux_amd64'
-            container: 'ubuntu:18.04'
-          - arch: 'linux_arm64'
-            container: 'ubuntu:18.04'
-          # - arch: 'linux_amd64_gcc4'
-          #   container: 'quay.io/pypa/manylinux2014_x86_64'
-    env:
-      GEN: ninja
+          - target: x86_64-unknown-linux-gnu
+            arch: linux_amd64
+          - target: aarch64-unknown-linux-gnu
+            arch: linux_arm64
 
     steps:
-    - name: Install required ubuntu packages
-      if: ${{ matrix.arch == 'linux_amd64' || matrix.arch == 'linux_arm64' }}
-      run: |
-        apt-get update -y -qq
-        apt-get install -y -qq software-properties-common
-        add-apt-repository ppa:git-core/ppa
-        apt-get update -y -qq
-        apt-get install -y -qq \
-          build-essential \
-          checkinstall \
-          clang-5.0 \
-          curl \
-          g++-multilib \
-          gcc-multilib \
-          gettext \
-          lib32readline6-dev \
-          libc6-dev-i386 \
-          libclang-5.0-dev \
-          libcurl4-gnutls-dev \
-          libexpat1-dev \
-          libffi-dev \
-          libssl-dev \
-          libssl-dev \
-          libz-dev \
-          make \
-          maven \
-          ninja-build \
-          openjdk-8-jdk \
-          openssh-client \
-          unixodbc-dev \
-          unzip \
-          wget \
-          zip
+    - uses: actions/checkout@v4
 
-    - name: Install required ubuntu packages
-      if: ${{ matrix.arch == 'linux_amd64_gcc4' }}
-      run: |
-        yum install -y centos-release-scl llvm-toolset-7
-        echo /opt/rh/llvm-toolset-7/root/usr/bin >> $GITHUB_PATH
-
-    - name: Install latest nightly rust toolchain
-      uses: actions-rs/toolchain@v1
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
       with:
-          toolchain: nightly
-          override: true
-          components: rustfmt, clippy
+        targets: ${{ matrix.target }}
 
-    - name: Install Git 2.18.5
-      if: ${{ matrix.arch == 'linux_amd64' || matrix.arch == 'linux_arm64' }}
+    - name: Install cross-compilation tools (arm64)
+      if: ${{ matrix.target == 'aarch64-unknown-linux-gnu' }}
       run: |
-        wget https://github.com/git/git/archive/refs/tags/v2.18.5.tar.gz
-        tar xvf v2.18.5.tar.gz
-        cd git-2.18.5
-        make
-        make prefix=/usr install
-        git --version
+        sudo apt-get update -y -qq
+        sudo apt-get install -y -qq gcc-aarch64-linux-gnu
 
-    - uses: actions/checkout@v3
-      with:
-        fetch-depth: 0
-        submodules: 'true'
-
-    - name: Checkout DuckDB to version
-      if: ${{ matrix.duckdb_version != '<submodule_version>'}}
-      run: |
-        cd duckdb
-        git checkout ${{ matrix.duckdb_version }}
-        cd ../duckdb_athena_rust/duckdb
-        git checkout ${{ matrix.duckdb_version }}
-
-    - if: ${{ matrix.arch == 'linux_amd64_gcc4' }}
-      uses: ./duckdb/.github/actions/centos_7_setup
-      with:
-        openssl: 0
-
-    - if: ${{ matrix.arch == 'linux_amd64' || matrix.arch == 'linux_arm64' }}
-      uses: ./duckdb/.github/actions/ubuntu_18_setup
-      with:
-        aarch64_cross_compile: ${{ matrix.arch == 'linux_arm64' && 1 }}
-
-      # Build extension
     - name: Build extension
       env:
-        GEN: ninja
-        STATIC_LIBCPP: 1
-        # TARGET_CC instead of CC: https://github.com/briansmith/ring/issues/578#issuecomment-510988473
-        TARGET_CC: ${{ matrix.arch == 'linux_arm64' && 'aarch64-linux-gnu-gcc' || '' }}
-        TARGET_CXX: ${{ matrix.arch == 'linux_arm64' && 'aarch64-linux-gnu-g++' || '' }}
+        CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
       run: |
-        make release
+        cargo build --release --target ${{ matrix.target }}
+        cp target/${{ matrix.target }}/release/libduckdb_athena.so athena.duckdb_extension
 
     - uses: actions/upload-artifact@v4
       with:
-        name: ${{matrix.arch}}-extensions
-        path: |
-          build/release/extension/duckdb-athena-extension/athena.duckdb_extension
+        name: ${{ matrix.arch }}-extensions
+        path: athena.duckdb_extension
 
-    - name: configure aws credentials
-      uses: aws-actions/configure-aws-credentials@v1
+    - name: Configure AWS credentials
+      if: ${{ env.OIDC_ROLE_ARN != '' }}
+      uses: aws-actions/configure-aws-credentials@v4
       with:
         role-to-assume: ${{ secrets.OIDC_ROLE_ARN }}
         aws-region: ${{ secrets.S3_REGION }}
+      env:
+        OIDC_ROLE_ARN: ${{ secrets.OIDC_ROLE_ARN }}
 
     - name: Deploy
+      if: ${{ env.BUCKET_NAME != '' && (startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main') }}
       env:
         BUCKET_NAME: ${{ secrets.S3_BUCKET }}
       run: |
-        git config --global --add safe.directory '*'
-        cd duckdb
-        git fetch --tags
-        export DUCKDB_VERSION=`git tag --points-at HEAD`
-        export DUCKDB_VERSION=${DUCKDB_VERSION:=`git log -1 --format=%h`}
-        cd ..
-        if [[ "$BUCKET_NAME" == "" ]] ; then
-          echo 'No bucket set, skipping'
-        elif [[ "$GITHUB_REF" =~ ^(refs/tags/v.+)$ ]] ; then
-          python3 -m pip install pip awscli
-          ./scripts/extension-upload.sh athena ${{ github.ref_name }} $DUCKDB_VERSION ${{matrix.arch}} $BUCKET_NAME true
-        elif [[ "$GITHUB_REF" =~ ^(refs/heads/main)$ ]] ; then
-          python3 -m pip install pip awscli
-          ./scripts/extension-upload.sh athena `git log -1 --format=%h` $DUCKDB_VERSION ${{matrix.arch}} $BUCKET_NAME false
+        EXTENSION_VERSION=${{ github.ref_name }}
+        if [[ "$GITHUB_REF" =~ ^(refs/heads/main)$ ]]; then
+          EXTENSION_VERSION=$(git log -1 --format=%h)
         fi
+        aws s3 cp athena.duckdb_extension \
+          s3://${BUCKET_NAME}/duckdb-athena/${EXTENSION_VERSION}/${{ matrix.arch }}/athena.duckdb_extension
+
