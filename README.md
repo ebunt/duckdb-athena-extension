@@ -28,11 +28,24 @@ cargo build --release
 
 The compiled extension is placed in `target/release/` with a platform-specific name:
 
-| Platform | File |
+| Platform | Raw output file |
 |---|---|
 | Linux | `target/release/libduckdb_athena.so` |
 | macOS | `target/release/libduckdb_athena.dylib` |
 | Windows | `target/release/duckdb_athena.dll` |
+
+DuckDB 1.0+ only loads files with the `.duckdb_extension` suffix, so copy the output to the required name:
+
+```bash
+# Linux
+cp target/release/libduckdb_athena.so target/release/duckdb_athena.duckdb_extension
+
+# macOS
+cp target/release/libduckdb_athena.dylib target/release/duckdb_athena.duckdb_extension
+
+# Windows (PowerShell)
+Copy-Item target\release\duckdb_athena.dll target\release\duckdb_athena.duckdb_extension
+```
 
 ## AWS credentials
 
@@ -53,23 +66,21 @@ The IAM principal needs at minimum:
 
 ## Loading the extension
 
-DuckDB must be started with the `-unsigned` flag to load locally built extensions:
+DuckDB 1.0+ requires two things when loading a locally compiled extension:
+
+1. **`.duckdb_extension` suffix** – DuckDB will refuse to load any file that does not end with `.duckdb_extension`.
+2. **Metadata-mismatch bypass** – locally compiled extensions do not carry the same build metadata that DuckDB expects from official releases, so the `allow_extensions_metadata_mismatch` setting must be enabled.
+
+Start DuckDB with the `-unsigned` flag and set `allow_extensions_metadata_mismatch` before loading:
 
 ```bash
-AWS_REGION=us-east-1 duckdb -unsigned
+AWS_REGION=us-east-1 duckdb -unsigned -cmd "SET allow_extensions_metadata_mismatch=true;"
 ```
 
-Then load the extension file (adjust the path and filename for your platform):
+Then load the extension (the path is the same on all platforms after the copy step above):
 
 ```sql
--- Linux
-LOAD 'target/release/libduckdb_athena.so';
-
--- macOS
-LOAD 'target/release/libduckdb_athena.dylib';
-
--- Windows
-LOAD 'target/release/duckdb_athena.dll';
+LOAD 'target/release/duckdb_athena.duckdb_extension';
 ```
 
 ## Usage
@@ -111,7 +122,7 @@ There are no automated unit tests in this repository yet. To verify the extensio
 
 1. Build the extension as described above.
 2. Export your AWS credentials and region.
-3. Start DuckDB with `-unsigned` and load the extension.
+3. Start DuckDB with `-unsigned` and `allow_extensions_metadata_mismatch=true`, then load the extension.
 4. Run a query against a known table in your default Glue catalog:
 
 ```sql
