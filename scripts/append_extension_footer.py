@@ -22,7 +22,7 @@ Usage:
 
 import sys
 import platform
-import struct
+import os
 
 
 FIELD_SIZE = 32
@@ -33,10 +33,13 @@ FOOTER_SIZE = FIELD_SIZE * NUM_FIELDS + SIGNATURE_SIZE  # 512
 MAGIC_VALUE = b"4"
 ABI_TYPE = b"C_STRUCT"
 DUCKDB_CAPI_VERSION = b"v1.2.0"
-EXTENSION_VERSION = b"v0.1.0"
+EXTENSION_VERSION = os.environ.get("DUCKDB_EXTENSION_VERSION", "v0.1.0").encode()
 
 
 def get_duckdb_platform() -> bytes:
+    if configured_platform := os.environ.get("DUCKDB_PLATFORM"):
+        return configured_platform.encode()
+
     system = platform.system()
     machine = platform.machine()
 

@@ -9,7 +9,10 @@ use aws_sdk_athena::{
     Client as AthenaClient,
 };
 use aws_sdk_glue::Client as GlueClient;
-use libduckdb_sys::{duckdb_data_chunk, duckdb_data_chunk_set_size, duckdb_bind_info, duckdb_function_info, duckdb_function_set_error, duckdb_init_info, idx_t};
+use libduckdb_sys::{
+    duckdb_bind_info, duckdb_data_chunk, duckdb_data_chunk_set_size, duckdb_function_info,
+    duckdb_function_set_error, duckdb_init_info, idx_t,
+};
 use quack_rs::{
     table::{BindInfo, FfiBindData, FfiInitData, TableFunctionBuilder},
     types::TypeId,
@@ -26,15 +29,23 @@ struct ScanBindData {
     database: String,
     output_location: String,
     limit: i32,
+    predicate: Option<String>,
 }
 
 impl ScanBindData {
-    fn new(tablename: &str, database: &str, output_location: &str, limit: i32) -> Self {
+    fn new(
+        tablename: &str,
+        database: &str,
+        output_location: &str,
+        limit: i32,
+        predicate: Option<String>,
+    ) -> Self {
         Self {
             tablename: tablename.to_owned(),
             database: database.to_owned(),
             output_location: output_location.to_owned(),
             limit,
+            predicate,
         }
     }
 }
@@ -107,7 +118,8 @@ pub fn result_set_to_duckdb_data_chunk(
 ) -> anyhow::Result<()> {
     let result_size = rows.len();
     let col_infos = metadata.column_info();
-    let chunk_col_count = unsafe { libduckdb_sys::duckdb_data_chunk_get_column_count(chunk) } as usize;
+    let chunk_col_count =
+        unsafe { libduckdb_sys::duckdb_data_chunk_get_column_count(chunk) } as usize;
 
     for row_idx in 0..result_size {
         let row = &rows[row_idx];
@@ -169,6 +181,72 @@ fn format_bytes(bytes: i64) -> String {
     }
 }
 
+fn quote_identifier(identifier: &str) -> String {
+    format!("\"{}\"", identifier.replace('"', "\"\""))
+}
+
+fn qualified_table(database: &str, tablename: &str) -> String {
+    format!(
+        "{}.{}",
+        quote_identifier(database),
+        quote_identifier(tablename)
+    )
+}
+
+fn validate_predicate(predicate: &str) -> anyhow::Result<String> {
+    let predicate = predicate.trim();
+    if predicate.is_empty() {
+        anyhow::bail!("predicate must not be empty");
+    }
+    if predicate.contains('\0') {
+        anyhow::bail!("predicate must not contain NUL bytes");
+    }
+    if predicate.contains(';') {
+        anyhow::bail!("predicate must be a single WHERE expression without semicolons");
+    }
+    if predicate.contains("--") || predicate.contains("/*") || predicate.contains("*/") {
+        anyhow::bail!("predicate must not contain SQL comments");
+    }
+
+    let uppercase = predicate.to_ascii_uppercase();
+    for keyword in [
+        " SELECT ",
+        " INSERT ",
+        " UPDATE ",
+        " DELETE ",
+        " CREATE ",
+        " DROP ",
+        " ALTER ",
+        " TRUNCATE ",
+        " UNLOAD ",
+        " MSCK ",
+        " REPAIR ",
+    ] {
+        if format!(" {uppercase} ").contains(keyword) {
+            anyhow::bail!("predicate must be a WHERE expression, not a full SQL statement");
+        }
+    }
+
+    Ok(predicate.to_owned())
+}
+
+fn build_athena_query(
+    database: &str,
+    tablename: &str,
+    predicate: Option<&str>,
+    maxrows: i32,
+) -> String {
+    let mut query = format!("SELECT * FROM {}", qualified_table(database, tablename));
+    if let Some(predicate) = predicate {
+        query.push_str(" WHERE ");
+        query.push_str(predicate);
+    }
+    if maxrows > 0 {
+        query.push_str(&format!(" LIMIT {maxrows}"));
+    }
+    query
+}
+
 /// # Safety
 #[no_mangle]
 unsafe extern "C" fn read_athena_bind(bind_info: duckdb_bind_info) {
@@ -194,7 +272,11 @@ unsafe extern "C" fn read_athena_bind(bind_info: duckdb_bind_info) {
             }
         };
         let maxrows_val = bi.get_named_parameter_value("maxrows");
-        let maxrows = if maxrows_val.is_null() { 0 } else { maxrows_val.as_i32() };
+        let maxrows = if maxrows_val.is_null() {
+            0
+        } else {
+            maxrows_val.as_i32()
+        };
         let database = {
             let db_val = bi.get_named_parameter_value("database").as_str();
             match db_val {
@@ -202,9 +284,30 @@ unsafe extern "C" fn read_athena_bind(bind_info: duckdb_bind_info) {
                 _ => "default".to_owned(),
             }
         };
+        let predicate = {
+            let predicate_val = bi.get_named_parameter_value("predicate");
+            if predicate_val.is_null() {
+                None
+            } else {
+                match predicate_val.as_str() {
+                    Ok(s) if s.trim().is_empty() => None,
+                    Ok(s) => match validate_predicate(&s) {
+                        Ok(predicate) => Some(predicate),
+                        Err(e) => {
+                            bi.set_error(&e.to_string());
+                            return;
+                        }
+                    },
+                    Err(e) => {
+                        bi.set_error(&e.to_string());
+                        return;
+                    }
+                }
+            }
+        };
 
-        let config = crate::RUNTIME
-            .block_on(aws_config::defaults(BehaviorVersion::latest()).load());
+        let config =
+            crate::RUNTIME.block_on(aws_config::defaults(BehaviorVersion::latest()).load());
         let client = GlueClient::new(&config);
 
         let table_result = crate::RUNTIME.block_on(
@@ -241,7 +344,10 @@ unsafe extern "C" fn read_athena_bind(bind_info: duckdb_bind_info) {
         }
 
         let limit = if maxrows > 0 { maxrows } else { DEFAULT_LIMIT };
-        FfiBindData::<ScanBindData>::set(bind_info, ScanBindData::new(&tablename, &database, &output_location, limit));
+        FfiBindData::<ScanBindData>::set(
+            bind_info,
+            ScanBindData::new(&tablename, &database, &output_location, limit, predicate),
+        );
     }
 }
 
@@ -258,20 +364,17 @@ unsafe extern "C" fn read_athena_init(info: duckdb_init_info) {
         let database = bind_data.database.clone();
         let output_location = bind_data.output_location.clone();
         let maxrows = bind_data.limit;
+        let predicate = bind_data.predicate.as_deref();
 
-        let config = crate::RUNTIME
-            .block_on(aws_config::defaults(BehaviorVersion::latest()).load());
+        let config =
+            crate::RUNTIME.block_on(aws_config::defaults(BehaviorVersion::latest()).load());
         let client = AthenaClient::new(&config);
 
         let result_config = ResultConfiguration::builder()
             .output_location(output_location)
             .build();
 
-        let qualified_table = format!("\"{}\".\"{}\"", database.replace('"', ""), tablename.replace('"', ""));
-        let mut query = format!("SELECT * FROM {}", qualified_table);
-        if maxrows > 0 {
-            query = format!("{} LIMIT {}", query, maxrows);
-        }
+        let query = build_athena_query(&database, &tablename, predicate, maxrows);
 
         let start_resp = crate::RUNTIME.block_on(
             client
@@ -291,7 +394,10 @@ unsafe extern "C" fn read_athena_init(info: duckdb_init_info) {
             }
         };
 
-        println!("Running Athena query, execution id: {}", &query_execution_id);
+        println!(
+            "Running Athena query, execution id: {}",
+            &query_execution_id
+        );
 
         loop {
             let get_resp = crate::RUNTIME.block_on(
@@ -368,8 +474,62 @@ pub fn build_table_function_def() -> TableFunctionBuilder {
         .param(TypeId::Varchar)
         .named_param("maxrows", TypeId::Integer)
         .named_param("database", TypeId::Varchar)
+        .named_param("predicate", TypeId::Varchar)
         .bind(read_athena_bind)
         .init(read_athena_init)
         .scan(read_athena)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::{build_athena_query, qualified_table, validate_predicate};
+
+    #[test]
+    fn qualified_table_quotes_identifiers() {
+        assert_eq!(
+            qualified_table("analytics", "events"),
+            "\"analytics\".\"events\""
+        );
+        assert_eq!(
+            qualified_table("odd\"db", "odd\"table"),
+            "\"odd\"\"db\".\"odd\"\"table\""
+        );
+    }
+
+    #[test]
+    fn build_query_includes_predicate_before_limit() {
+        assert_eq!(
+            build_athena_query("analytics", "events", Some("year = 2024"), 100),
+            "SELECT * FROM \"analytics\".\"events\" WHERE year = 2024 LIMIT 100"
+        );
+    }
+
+    #[test]
+    fn build_query_omits_limit_for_non_positive_limit() {
+        assert_eq!(
+            build_athena_query("analytics", "events", Some("year = 2024"), 0),
+            "SELECT * FROM \"analytics\".\"events\" WHERE year = 2024"
+        );
+    }
+
+    #[test]
+    fn validate_predicate_accepts_simple_where_expression() {
+        assert_eq!(
+            validate_predicate(" year = 2024 AND event_type = 'click' ").unwrap(),
+            "year = 2024 AND event_type = 'click'"
+        );
+    }
+
+    #[test]
+    fn validate_predicate_rejects_statement_separators_and_comments() {
+        assert!(validate_predicate("year = 2024; DROP TABLE events").is_err());
+        assert!(validate_predicate("year = 2024 -- comment").is_err());
+        assert!(validate_predicate("year = 2024 /* comment */").is_err());
+    }
+
+    #[test]
+    fn validate_predicate_rejects_full_sql_statements() {
+        assert!(validate_predicate("SELECT * FROM events").is_err());
+        assert!(validate_predicate("year = 2024 DELETE FROM events").is_err());
+    }
+}

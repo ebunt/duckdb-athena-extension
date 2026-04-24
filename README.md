@@ -47,6 +47,14 @@ Then load the extension:
 LOAD 'target/release/duckdb_athena.duckdb_extension';
 ```
 
+-OR-
+
+In one statement:
+
+```bash
+duckdb -unsigned -cmd "LOAD 'target/release/duckdb_athena.duckdb_extension';"
+```
+
 ## Usage
 
 ### Basic scan
@@ -75,11 +83,24 @@ SELECT * FROM athena_scan('my_table', 's3://my-results-bucket/prefix/', maxrows=
 
 ### Filter results
 
-Filter pushdown is not implemented — DuckDB filters after the full scan:
+DuckDB `WHERE` clauses are not pushed down automatically yet. For the MVP, pass an Athena SQL predicate with `predicate=` to add a `WHERE` clause to the query submitted to Athena:
 
 ```sql
-SELECT * FROM athena_scan('my_table', 's3://my-results-bucket/prefix/', maxrows=-1)
-WHERE year = 2024;
+SELECT *
+FROM athena_scan(
+  'my_table',
+  's3://my-results-bucket/prefix/',
+  database='my_database',
+  predicate='year = 2024'
+);
+```
+
+You can still use a normal DuckDB `WHERE` clause for local filtering after Athena returns results:
+
+```sql
+SELECT *
+FROM athena_scan('my_table', 's3://my-results-bucket/prefix/', predicate='year = 2024')
+WHERE event_type = 'click';
 ```
 
 ### Count rows
@@ -99,6 +120,6 @@ Total execution time: 1307 millis
 ## Limitations
 
 - Not all Athena data types are supported (complex types: array, map, struct)
-- Filter pushdown is not implemented — the full table is always scanned
+- Automatic DuckDB filter pushdown is not implemented; use `predicate=` for manual Athena-side filtering
 - Defaults to 10,000 rows (`maxrows=-1` to disable)
 - Workgroup is hardcoded to `primary`

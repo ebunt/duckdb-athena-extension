@@ -1,6 +1,5 @@
 use libduckdb_sys::{
-    duckdb_data_chunk, duckdb_data_chunk_get_vector, duckdb_vector_assign_string_element_len,
-    idx_t,
+    duckdb_data_chunk, duckdb_data_chunk_get_vector, duckdb_vector_assign_string_element_len, idx_t,
 };
 use quack_rs::{types::TypeId, vector::VectorWriter};
 

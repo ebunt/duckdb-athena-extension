@@ -19,4 +19,3 @@ impl From<Box<dyn std::error::Error>> for Error {
         Self::DuckDB(value.to_string())
     }
 }
-
